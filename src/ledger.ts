@@ -81,6 +81,13 @@ export type ActionLedgerEntry =
       reason: TriggerReason
       /** Related established lesson slugs examined for the BL-3 branch. */
       relatedLessons?: string[]
+      /** 门① (N4): the jev same-problem band when the enhancement layer
+       *  judged this fire decision. Absent when the layer is off/disabled —
+       *  the pure-code row stays byte-identical (off-guard pinned). The
+       *  full judgment (digest/probability/outcome) lives in
+       *  meta/improve-decisions.jsonl, never here. */
+      jevBand?: 'adopt' | 'record' | 'fallback'
+      jevProbability?: number
     }
   | {
       at: string
@@ -120,6 +127,9 @@ export type ReviewAction =
   | 'draft-trigger-declined'
   | 'draft-collision'
   | 'draft-write-failed'
+  /** 门③ (N4): the jev quality gate answered <0.10 — draft archived, never
+   *  queued. (A jev call FAILURE proceeds on the structure self-check.) */
+  | 'draft-quality-gate'
   /** Approve/reject on a queue object (lesson seam or skill install/archive). */
   | 'approved'
   | 'rejected'

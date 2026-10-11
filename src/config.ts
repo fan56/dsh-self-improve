@@ -8,13 +8,14 @@
  *                       host behavior); shadow collects + ledgers, never
  *                       feeds; on collects, ledgers AND feeds.
  *   improveJevBackend — the jev decision layer backend ('' = layer off;
- *                       'zen' = opencode-zen). Key lands in wave N1, the
- *                       wiring lands in wave N4 — until then nothing reads
- *                       it beyond this schema.
+ *                       'zen' = opencode-zen). Key landed in wave N1, the
+ *                       wiring landed in wave N4: the four judgment gates
+ *                       (trigger cluster / lesson contradiction / draft
+ *                       quality / 90-day retire review) call through it.
  *   improveJevModel   — pinned decision model; '' = sentinel resolving to
  *                       the backend default (jev-1.13-free for zen) at call
  *                       time, same sentinel pattern as topics-memory's
- *                       jevModel. Unused until N4.
+ *                       jevModel. Wired in N4.
  *
  * All three are volatile: a 0.1.7 host hands apply() live references and
  * swaps them in-place on a settings-page edit, so a shadow↔on flip is hot.

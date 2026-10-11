@@ -1,7 +1,26 @@
 /**
  * dsh-self-improve — the self-improvement loop for dsh (spec 卷二 is the
  * contract; wave N1 the foundation, N3 the approval CLI + skills asset
- * loop, N2 the trigger engine + interruption fast lane).
+ * loop, N2 the trigger engine + interruption fast lane, N4 the jev decision
+ * layer + the approval evidence summary).
+ *
+ * Wave-N4 additions:
+ *   jev 增强层 (src/jev-gate.ts, improveJevBackend='' | zen):
+ *     门① trigger-cluster — the engine asks 「同一个问题吗」 before firing
+ *                          (adopt/record fire, fallback vetoes, 24h sticky);
+ *     门② lesson-contradiction — approve-lesson warning lines (人审优先,
+ *                          never blocks);
+ *     门③ draft-quality — below-0.10 drafts never queue (archived + ledgered),
+ *                          call failures leave the self-check final;
+ *     门④ retire-review — installed auto skills ≥90d asked on the periodic
+ *                          slot; answered <0.10 surfaces as a queue
+ *                          suggestion, the human decides (reject retires).
+ *   Off ('' backend) = zero calls, zero decision rows, byte-identical pure
+ *   paths (guard-pinned). Every judgment lands one whitelisted row in
+ *   meta/improve-decisions.jsonl — never the judged text (红线⑤).
+ *   Evidence summary (蒸馏路由, not jev): /improve-review show gains LLM
+ *   pro/con one-liners with an id+digest cache; failures fall back to the
+ *   machine summary verbatim.
  *
  * Wave-N2 shape:
  *   settings (`dsh-self-improve` namespace, three volatile keys)
@@ -19,6 +38,7 @@
  *     (daily ≤1). off: the engine never runs, zero reads.
  *   periodic (once per session, dsh-cron-friendly):
  *     unused-injection snapshot from the peer's usage aggregate
+ *     + 门④ retire review (jev layer on only)
  *
  * Gate semantics (spec §7 MJ-A + the wave-N3 refinement for the human
  * surface):
@@ -52,10 +72,11 @@ import type { StructuredObservation } from '@aiwayds/dsh-topics-memory'
 import { normalizeImproveLoop, readConfigValue, snapshotConfig, SelfImproveConfig, type SelfImproveConfigValue, type SelfImproveRuntimeConfig } from './config.ts'
 import { openPeerHandle, resolveImproveBundleRoot, unusedInjectionObservations, type PeerHandle } from './feed.ts'
 import { ActionLedger } from './ledger.ts'
+import { createJevGate, type JevGate } from './jev-gate.ts'
 import { registerReviewCommand, type ReviewCommandDeps } from './review.ts'
 import { defaultDraftsRoot, defaultSkillsRoot, generateSkillDraft } from './skill-draft.ts'
 import { SignalCollector } from './signals.ts'
-import { createInterruptionHint, SCAN_THROTTLE_MS, scanTriggers } from './triggers.ts'
+import { createInterruptionHint, SCAN_THROTTLE_MS, scanRetireReview, scanTriggers } from './triggers.ts'
 
 export const name = 'dsh-self-improve'
 
@@ -77,6 +98,9 @@ export interface LoopDeps {
   /** Monotonic-ish clock for the per-session scan throttle (tests inject a
    *  stepping counter; default wall clock). */
   monoNow?(): number
+  /** Jev gate override (tests mock it; default = the real zen client over
+   *  the live improveJevBackend/improveJevModel keys). */
+  jev?: JevGate
 }
 
 const defaultDeps: LoopDeps = {
@@ -113,6 +137,16 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
   // ---- /improve-review (all gates; human-initiated surface) ----
   // Registration must not probe the peer or the filesystem — everything
   // inside the handler resolves lazily per invocation.
+  // The jev decision layer (N4): constructed unconditionally but INERT until
+  // improveJevBackend=zen — enabled() re-reads the live key per call (hot
+  // flip), and a disabled layer makes zero remote calls and writes zero
+  // decision rows (the pure-code paths stay byte-identical, guard-pinned).
+  const jevGate = deps.jev ?? createJevGate({
+    backend: () => cfgNow().improveJevBackend,
+    model: () => cfgNow().improveJevModel,
+    decisionsFile: () => join(deps.bundleRoot(), 'meta', 'improve-decisions.jsonl'),
+    now: nowIso,
+  })
   const reviewDeps: ReviewCommandDeps = {
     gate: () => normalizeImproveLoop(cfgNow().improveLoop),
     ledger,
@@ -121,6 +155,7 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
     draftsRoot: () => (deps.draftsRoot !== undefined ? deps.draftsRoot() : defaultDraftsRoot()),
     skillsRoot: () => (deps.skillsRoot !== undefined ? deps.skillsRoot() : defaultSkillsRoot()),
     now: nowIso,
+    jev: jevGate,
     ...(deps.llm !== undefined ? { llm: deps.llm } : {}),
   }
   registerReviewCommand(host, reviewDeps)
@@ -217,6 +252,7 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
     ledgerFile,
     draftsRoot: () => (deps.draftsRoot !== undefined ? deps.draftsRoot() : defaultDraftsRoot()),
     now: nowIso,
+    jev: jevGate,
     ...(deps.llm !== undefined ? { llm: deps.llm } : {}),
   }
   const maybeScanTriggers = (sessionId: string): void => {
@@ -233,6 +269,7 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
       openPeer: () => peerOf(),
       now: nowIso,
       generate: (input) => generateSkillDraft(input, draftDeps),
+      jev: jevGate,
     }).catch(() => {
       // Contained: a broken scan costs one engine tick, never the session.
     })
@@ -272,6 +309,18 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
         checkedSessions.add(sessionId)
         void periodicCheck(`unused-injection:${sessionId}`).catch(() => {
           // Contained.
+        })
+        // 门④ 90-day retire review rides the same periodic slot (N4, spec
+        // 增补节): layer off → zero reads/calls inside; per-skill 24h
+        // recheck window bounds the remote cost; suggestions are ledger
+        // rows only — nothing is ever uninstalled here.
+        void scanRetireReview({
+          jev: jevGate,
+          skillsRoot: () => (deps.skillsRoot !== undefined ? deps.skillsRoot() : defaultSkillsRoot()),
+          openPeer: () => peerOf(),
+          now: nowIso,
+        }).catch(() => {
+          // Contained: a broken retire scan costs one periodic tick.
         })
       }
       // The N2 trigger engine scan: every turn end, throttled to one scan

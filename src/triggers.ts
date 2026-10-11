@@ -31,14 +31,24 @@
  * shadow = full computation, would-fire ledger rows only, nothing fires and
  * no hint draft is produced; on = everything.
  *
+ * Wave N4 adds two jev gates (src/jev-gate.ts, improveJevBackend=zen only;
+ * layer off = pure-code paths, zero calls): 门① trigger-cluster — the
+ * would-fire target is asked 「同一个问题吗」 before an actual fire (adopt/
+ * record fire, fallback vetoes, 24h sticky window); 门④ retire-review —
+ * installed auto skills ≥90d are batch-asked 「仍有存在价值吗」 on the
+ * periodic slot, answered <0.10 lands a queue suggestion, never an
+ * auto-uninstall.
+ *
  * @module triggers
  */
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 import type { ActionLedger, TriggerReason } from './ledger.ts'
 import type { PeerHandle, PeerLessonEntry } from './feed.ts'
-import type { DraftOutcome, EvidenceSignal, SkillTriggerInput } from './skill-draft.ts'
+import { parseSkillMd, type DraftOutcome, type EvidenceSignal, type ParsedSkillMd, type SkillTriggerInput } from './skill-draft.ts'
+import { JUDGMENT_RECHECK_MS, cap, recentRowsFor, type JevBand, type JevGate } from './jev-gate.ts'
 
 /** B3 决议 1: the same-class failure window, in days. */
 export const TRIGGER_WINDOW_DAYS = 7
@@ -263,6 +273,10 @@ export interface TriggerScanDeps {
   generate(input: SkillTriggerInput): Promise<DraftOutcome>
   windowDays?: number
   threshold?: number
+  /** 门① trigger-cluster judgment (N4, spec 增补节). Undefined or disabled
+   *  layer → the pure-code decision stands untouched (zero calls, zero
+   *  rows, byte-identical rows). */
+  jev?: JevGate
 }
 
 export interface TriggerScanResult {
@@ -273,10 +287,33 @@ export interface TriggerScanResult {
 }
 
 /**
+ * 门① state text — cluster features only (红线⑤: no message/error bodies
+ * exist upstream to include).
+ */
+export function clusterJudgeState(c: FailureCluster): string {
+  return `cluster key=${c.key} failures=${c.count} window_days=${TRIGGER_WINDOW_DAYS} last=${c.lastAt}`
+}
+
+/** Two-sided noul criteria of the same-problem question (zen requires the
+ *  instructions; both sides measurably improve calibration). */
+const CLUSTER_CRITERIA = {
+  true: '是同一个问题（同类失败，值得生成技能草稿）',
+  false: '不是同一问题，或属于一次性噪音（不应触发草稿）',
+} as const
+
+/**
  * One engine scan. Every CANDIDATE (threshold-passing cluster) lands a
  * `trigger` ledger row — fire and no-fire alike; scans with no candidates
  * are read-only (a per-minute scan must not churn the ledger with noise).
  * shadow rows are the would-fire band: `wouldFire: true, fired: false`.
+ *
+ * 门① (N4): when the jev layer is enabled AND a fire is actually intended
+ * (gate=on, cap unspent), the would-fire target is asked 「这 N 次失败是同一
+ * 个问题吗」 before firing. band adopt (≥0.60) → fire; record (0.10–0.60) →
+ * still fire, band kept on the row; fallback (<0.10 answered, or any call
+ * failure) → NO fire (防噪音优先), band+outcome kept on the row. The
+ * judgment is sticky for the recheck window (a prior row is honored without
+ * re-asking — a zen outage must not produce one fallback row per minute).
  */
 export async function scanTriggers(deps: TriggerScanDeps): Promise<TriggerScanResult> {
   const now = deps.now()
@@ -294,9 +331,40 @@ export async function scanTriggers(deps: TriggerScanDeps): Promise<TriggerScanRe
 
   const spent = hasFiredToday(entries, now)
   const wouldTarget = decisions.find((d) => d.wouldFire)
-  const fireTarget = spent ? undefined : wouldTarget
+  let fireTarget = spent ? undefined : wouldTarget
   const gateAtFire = deps.gate()
-  const fire = gateAtFire === 'on' && fireTarget !== undefined
+  let fire = gateAtFire === 'on' && fireTarget !== undefined
+
+  // ---- 门① trigger-cluster judgment (N4) ----
+  let jevBand: JevBand | undefined
+  let jevProbability: number | undefined
+  let gatedKey: string | undefined
+  if (fire && fireTarget !== undefined && deps.jev !== undefined && deps.jev.enabled()) {
+    const jev = deps.jev
+    const ref = fireTarget.cluster.key
+    const prior = recentRowsFor(jev.decisionsFile(), 'trigger-cluster', ref, now, JUDGMENT_RECHECK_MS).at(-1)
+    const judgment = prior !== undefined
+      ? { band: prior.band, ...(prior.probability !== undefined ? { probability: prior.probability } : {}), outcome: prior.outcome }
+      : (await jev.judge({
+          gate: 'trigger-cluster',
+          state: clusterJudgeState(fireTarget.cluster),
+          subjects: [{
+            ref,
+            instructions: `这 ${fireTarget.cluster.count} 次失败是同一个问题吗`,
+            criteria: CLUSTER_CRITERIA,
+          }],
+        }).catch(() => undefined))?.get(ref)
+    if (judgment !== undefined) {
+      jevBand = judgment.band
+      jevProbability = judgment.probability
+      gatedKey = ref
+      if (judgment.band === 'fallback') {
+        fireTarget = undefined // veto holds for the recheck window (防噪音优先)
+        fire = false
+      }
+    }
+    // judgment undefined → the layer resolved "off" mid-call: pure code stands.
+  }
 
   for (const d of decisions) {
     const isTarget = fireTarget !== undefined && d.cluster.key === fireTarget.cluster.key
@@ -315,6 +383,10 @@ export async function scanTriggers(deps: TriggerScanDeps): Promise<TriggerScanRe
       count: d.cluster.count,
       reason,
       ...(relatedSlugs.length > 0 ? { relatedLessons: relatedSlugs } : {}),
+      // 门① fields only ever present when the layer judged this fire (the
+      // pure-code row stays byte-identical, off-guard pinned).
+      ...(d.cluster.key === gatedKey && jevBand !== undefined ? { jevBand } : {}),
+      ...(d.cluster.key === gatedKey && jevProbability !== undefined ? { jevProbability } : {}),
     })
   }
 
@@ -328,6 +400,134 @@ export async function scanTriggers(deps: TriggerScanDeps): Promise<TriggerScanRe
     })
     .catch((e): DraftOutcome => ({ status: 'refused', reason: 'llm-failed', detail: e instanceof Error ? e.name : 'unknown' }))
   return { status: 'scanned', decisions, fired: { key: fireTarget.cluster.key, outcome } }
+}
+
+// ---------------------------------------------------------------------------
+// 门④ 90-day retire review (N4, spec 增补节): installed auto-generated skills
+// aged ≥ RETIRE_AGE_DAYS (the frontmatter `created` stamp is the 90-day
+// marker) are batch-asked 「仍有存在价值吗」 on the periodic slot. An answered
+// <0.10 lands a suggestion row; /improve-review renders it; NOTHING is ever
+// uninstalled automatically — the human decides (reject on the installed id
+// archives it). Hand-written skills are never examined (红线④).
+// ---------------------------------------------------------------------------
+
+/** The age threshold, in days. */
+export const RETIRE_AGE_DAYS = 90
+/** Batch cap per scan (oldest first win the seats). */
+export const RETIRE_BATCH_CAP = 10
+
+export interface RetireSkill {
+  name: string
+  created: string
+  ageDays: number
+  evidence?: string
+  hits?: number
+  opens?: number
+}
+
+/**
+ * Installed auto-generated skills aged ≥ minAgeDays, oldest first, capped.
+ * Anything without our `source: auto-generated` marker (a hand-written skill,
+ * or an unparseable dir) is invisible to this scan — never read, never asked.
+ */
+export function listRetireCandidates(skillsRoot: string, nowIso: string, minAgeDays: number = RETIRE_AGE_DAYS): RetireSkill[] {
+  let names: string[]
+  try {
+    names = readdirSync(skillsRoot)
+  } catch {
+    return []
+  }
+  const now = Date.parse(nowIso)
+  if (!Number.isFinite(now)) return []
+  const out: RetireSkill[] = []
+  for (const dir of names) {
+    if (dir.startsWith('.')) continue
+    let fm: ParsedSkillMd | undefined
+    try {
+      fm = parseSkillMd(readFileSync(join(skillsRoot, dir, 'SKILL.md'), 'utf8'))
+    } catch {
+      continue
+    }
+    if (fm?.source !== 'auto-generated' || fm.name === undefined || fm.created === undefined) continue
+    const created = Date.parse(fm.created)
+    if (!Number.isFinite(created)) continue
+    const ageDays = Math.floor((now - created) / (24 * 60 * 60 * 1000))
+    if (ageDays < minAgeDays) continue
+    out.push({ name: fm.name, created: fm.created, ageDays, ...(fm.evidence !== undefined ? { evidence: fm.evidence } : {}) })
+  }
+  return out.sort((a, b) => b.ageDays - a.ageDays || (a.name < b.name ? -1 : 1)).slice(0, RETIRE_BATCH_CAP)
+}
+
+export interface RetireScanDeps {
+  jev: JevGate
+  skillsRoot(): string
+  openPeer(): Promise<PeerHandle | undefined>
+  now(): string
+}
+
+export interface RetireScanResult {
+  status: 'off' | 'no-candidates' | 'judged'
+  /** Skills actually asked this scan (post-throttle). */
+  asked: number
+  /** Names the backend answered 「已无存在价值」 — the queue renders these. */
+  suggested: string[]
+}
+
+/**
+ * One retire scan. Layer off → zero reads, zero calls (the enhancement-layer
+ * off guard). Per-skill recheck window: a skill judged inside the window is
+ * skipped, so a persistent session cadence costs at most one call per skill
+ * per day. The 30-day injection aggregate (when the peer exposes it) rides
+ * along as a value feature.
+ */
+export async function scanRetireReview(deps: RetireScanDeps): Promise<RetireScanResult> {
+  if (!deps.jev.enabled()) return { status: 'off', asked: 0, suggested: [] }
+  const now = deps.now()
+  const candidates = listRetireCandidates(deps.skillsRoot(), now)
+  if (candidates.length === 0) return { status: 'no-candidates', asked: 0, suggested: [] }
+  const fresh = candidates.filter((s) => recentRowsFor(deps.jev.decisionsFile(), 'retire-review', `skill:${s.name}`, now, JUDGMENT_RECHECK_MS).length === 0)
+  if (fresh.length === 0) return { status: 'judged', asked: 0, suggested: [] }
+
+  const peer = await deps.openPeer().catch(() => undefined)
+  const usage = (() => {
+    try {
+      return peer?.usageSignals() ?? new Map<string, { hits: number; opens: number }>()
+    } catch {
+      return new Map<string, { hits: number; opens: number }>()
+    }
+  })()
+  const subjects = fresh.map((s) => {
+    const u = usage.get(s.name)
+    return {
+      ...s,
+      ...(u !== undefined ? { hits: u.hits, opens: u.opens } : {}),
+    }
+  })
+  const state = subjects
+    .map((s, i) => {
+      let line = `${i + 1}. skill=${s.name} created=${s.created} age_days=${s.ageDays}`
+      if (s.hits !== undefined) line += ` usage_30d hits=${s.hits} opens=${s.opens ?? 0}`
+      if (s.evidence !== undefined) line += ` evidence=${cap(s.evidence, 120)}`
+      return line
+    })
+    .join('\n')
+  const judgments = await deps.jev
+    .judge({
+      gate: 'retire-review',
+      state,
+      subjects: subjects.map((s) => ({
+        ref: `skill:${s.name}`,
+        instructions: `这条已安装 ${s.ageDays} 天的技能仍有存在价值吗`,
+        criteria: { true: '仍有存在价值（保留）', false: '已无存在价值（建议退役复审）' },
+      })),
+    })
+    .catch(() => undefined)
+  const suggested: string[] = []
+  for (const s of subjects) {
+    const j = judgments?.get(`skill:${s.name}`)
+    if (j !== undefined && j.band === 'fallback' && j.outcome === 'ok') suggested.push(s.name)
+  }
+  return { status: 'judged', asked: subjects.length, suggested }
 }
 
 // ---------------------------------------------------------------------------

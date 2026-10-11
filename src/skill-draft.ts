@@ -26,14 +26,21 @@
  * Failure posture: every refusal is ledgered (`draft-*` review actions) and
  * the lane never throws into its caller (red line ②).
  *
+ * Wave N4 adds: 门③ draft-quality (jev layer — an answered <0.10 refuses the
+ * queue, archived + ledgered; call failures leave the self-check final) and
+ * the 审批证据 LLM 正反方摘要 (draftProCon — distilled glm-5.3-flash route,
+ * id+digest cache, machine fallback, not jev).
+ *
  * @module skill-draft
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { ActionLedger, ReviewAction } from './ledger.ts'
+import { LEDGER_MAX_BYTES } from './ledger.ts'
+import { cap, stateDigest, type JevGate } from './jev-gate.ts'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -290,6 +297,153 @@ export const bigmodelLlm: LlmFn = async ({ system, user }) => {
 }
 
 // ---------------------------------------------------------------------------
+// 审批证据 LLM 正反方摘要（第五增强, N4 — 蒸馏路由, 不占 jev）
+// ---------------------------------------------------------------------------
+
+/** The evidence summary's own deadline (spec 增补节: 15s), tighter than the
+ *  draft lane's 30s — a `show` is interactive. */
+export const SUMMARY_LLM_TIMEOUT_MS = 15_000
+/** Pro/con one-liners are capped — cache rows stay whitelist-small. */
+export const SUMMARY_LINE_MAX_CHARS = 200
+
+/** Same verified route, shorter deadline and output (two sentences). */
+export const summaryLlm: LlmFn = async ({ system, user }) => {
+  const key = readCredentialRef(DRAFT_LLM_CREDENTIAL_REF)
+  if (key === undefined) throw new Error('no-credential')
+  const res = await fetch(DRAFT_LLM_ENDPOINT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: DRAFT_LLM_MODEL,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      thinking: { type: 'disabled' },
+      max_tokens: 200,
+    }),
+    signal: AbortSignal.timeout(SUMMARY_LLM_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`llm-http-${res.status}`)
+  const body = (await res.json()) as { choices?: { message?: { content?: unknown } }[] }
+  const content = body.choices?.[0]?.message?.content
+  if (typeof content !== 'string' || content.trim() === '') throw new Error('llm-empty-response')
+  return content
+}
+
+const SUMMARY_SYSTEM_PROMPT = [
+  'You assist a human reviewer of an auto-generated SKILL.md draft.',
+  'Reply with ONE JSON object and nothing else:',
+  '{"pro":"一句话：这份草稿最强的点","con":"一句话：最大的风险或弱点"}',
+  'Each sentence ≤60 chars, concrete, no boilerplate.',
+  'The draft was machine-generated from anonymized failure statistics; judge structure, specificity and actionability only.',
+].join('\n')
+
+export function buildSummaryPrompt(evidence: string, draftText: string): { system: string; user: string } {
+  return {
+    system: SUMMARY_SYSTEM_PROMPT,
+    user: `Evidence (counts only): ${cap(evidence, 400)}\n\n——— SKILL.md draft ———\n${cap(draftText, 3000)}\n\nPro/con JSON now.`,
+  }
+}
+
+/** One whitelist cache row. pro/con are OUR OWN model's bounded one-liners
+ *  about OUR OWN draft — never conversation text (红线⑤). */
+export interface SummaryCacheEntry {
+  at: string
+  id: string
+  digest: string
+  pro: string
+  con: string
+}
+
+export function readSummaryCache(file: string, id: string, digest: string): SummaryCacheEntry | undefined {
+  let raw: string
+  try {
+    raw = readFileSync(file, 'utf8')
+  } catch {
+    return undefined
+  }
+  let found: SummaryCacheEntry | undefined
+  for (const line of raw.split('\n')) {
+    if (line === '') continue
+    try {
+      const e = JSON.parse(line) as Partial<SummaryCacheEntry>
+      if (e.id === id && e.digest === digest && typeof e.pro === 'string' && typeof e.con === 'string' && typeof e.at === 'string') {
+        found = { at: e.at, id, digest, pro: e.pro, con: e.con }
+      }
+    } catch {
+      // Contained.
+    }
+  }
+  return found
+}
+
+/** Append one cache row — the same ledger discipline (append, compact past
+ *  the action-ledger cap, silent on failure). */
+export function appendSummaryCache(file: string, entry: SummaryCacheEntry): void {
+  try {
+    let lines: string[] = []
+    try {
+      lines = readFileSync(file, 'utf8').split('\n').filter((l) => l !== '')
+      if (lines.length > 0 && statSync(file).size > LEDGER_MAX_BYTES) {
+        lines = lines.slice(Math.floor(lines.length / 4))
+      }
+    } catch {
+      // First write.
+    }
+    lines.push(JSON.stringify(entry))
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, lines.join('\n') + '\n')
+  } catch {
+    // The cache never breaks `show` (红线②).
+  }
+}
+
+export interface ProConSummary {
+  pro: string
+  con: string
+}
+
+/**
+ * The `/improve-review show` upgrade (N4): one pro and one con sentence for
+ * a draft, via the distilled glm-5.3-flash route. Cache-first (id+digest —
+ * an unchanged draft never re-calls); any failure resolves undefined so the
+ * caller keeps the machine-assembled summary verbatim. Never throws.
+ */
+export async function draftProCon(input: {
+  id: string
+  evidence?: string
+  draftText: string
+  cacheFile: string
+  llm?: LlmFn
+  now?: () => string
+}): Promise<ProConSummary | undefined> {
+  const digest = stateDigest(input.draftText)
+  const cached = readSummaryCache(input.cacheFile, input.id, digest)
+  if (cached !== undefined) return { pro: cached.pro, con: cached.con }
+  const prompt = buildSummaryPrompt(input.evidence ?? '-', input.draftText)
+  let text: string
+  try {
+    text = await (input.llm ?? summaryLlm)(prompt)
+  } catch {
+    return undefined
+  }
+  let parsed: unknown
+  try {
+    parsed = extractJson(text)
+  } catch {
+    return undefined
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined
+  const obj = parsed as Record<string, unknown>
+  const pro = typeof obj.pro === 'string' ? obj.pro.trim().slice(0, SUMMARY_LINE_MAX_CHARS) : ''
+  const con = typeof obj.con === 'string' ? obj.con.trim().slice(0, SUMMARY_LINE_MAX_CHARS) : ''
+  if (pro === '' || con === '') return undefined
+  appendSummaryCache(input.cacheFile, { at: (input.now ?? (() => new Date().toISOString()))(), id: input.id, digest, pro, con })
+  return { pro, con }
+}
+
+// ---------------------------------------------------------------------------
 // Draft assembly + shadow self-check gate (B3 决议 2: 不过不进队列)
 // ---------------------------------------------------------------------------
 
@@ -471,7 +625,7 @@ export type DraftOutcome =
   | { status: 'created'; name: string; file: string; evidence: string }
   | {
       status: 'refused'
-      reason: 'gate-off' | 'daily-cap' | 'secret-gate' | 'check-failed' | 'no-evidence' | 'trigger-declined' | 'write-failed' | 'collision' | 'llm-failed'
+      reason: 'gate-off' | 'daily-cap' | 'secret-gate' | 'check-failed' | 'no-evidence' | 'trigger-declined' | 'write-failed' | 'collision' | 'llm-failed' | 'quality-gate'
       detail?: string
     }
 
@@ -486,6 +640,7 @@ const REFUSAL_ACTION: Record<Exclude<DraftOutcome & { status: 'refused' }, never
   'write-failed': 'draft-write-failed',
   collision: 'draft-collision',
   'llm-failed': 'draft-llm-failed',
+  'quality-gate': 'draft-quality-gate',
 }
 
 export interface SkillDraftDeps {
@@ -496,12 +651,57 @@ export interface SkillDraftDeps {
   draftsRoot(): string
   now(): string
   llm?: LlmFn
+  /** 门③ draft-quality judgment (N4). Undefined or disabled layer → the
+   *  structure self-check result is final (zero calls, zero rows). */
+  jev?: JevGate
+}
+
+/** 门③ state text — the draft is OUR model's own output (never conversation
+ *  text); stats + capped head give the reviewer-model its evidence. */
+export function draftQualityState(parts: DraftParts): string {
+  const flat = parts.body.replace(/\s+/gu, ' ').trim()
+  return [
+    `skill_draft name=${parts.name}`,
+    `description=${cap(parts.description, 160)}`,
+    `whenToUse=${cap(parts.whenToUse, 160)}`,
+    `body_chars=${parts.body.length} body_lines=${parts.body.split('\n').length}`,
+    `body_head=${cap(flat, 400)}`,
+  ].join('\n')
+}
+
+const QUALITY_CRITERIA = {
+  true: '质量够格，进入审批队列',
+  false: '质量不够格，不进队列',
+} as const
+
+/** Archive stamp for below-quality drafts (kept for forensics, never queued). */
+function archiveStamp(): string {
+  return new Date().toISOString().replace(/[-:]/gu, '').replace(/\..*$/u, '').replace('T', '-')
+}
+
+/** The 「归档」 half of 不进队列: keep the rejected draft under .archived for
+ *  human forensics. Best-effort, silent (红线②). */
+function archiveRejectedDraft(md: string, draftsRoot: string, name: string): void {
+  try {
+    const dir = join(draftsRoot, '.archived', `${name}-${archiveStamp()}-quality`)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'SKILL.md'), md)
+  } catch {
+    // Contained.
+  }
 }
 
 /**
  * One draft-generation attempt for `input`. Refusals are ledgered review
  * actions; the lane never throws (红线②). Generation is allowed in shadow
  * AND on (risk-free per B4 决议 1 — a draft affects nothing), refused in off.
+ *
+ * 门③ (N4): after the structure self-check passes and BEFORE anything is
+ * queued, the jev layer is asked 「质量够格进审批队列吗」. An answered
+ * <0.10 refuses the queue (draft archived for forensics + ledgered). A call
+ * FAILURE is fail-open the other way: the structure self-check result is
+ * final (the layer promised never to block the loop); record-band (0.10–
+ * 0.60) proceeds with the judgment kept on the decisions ledger.
  */
 export async function generateSkillDraft(input: SkillTriggerInput, deps: SkillDraftDeps): Promise<DraftOutcome> {
   const at = deps.now()
@@ -543,6 +743,27 @@ export async function generateSkillDraft(input: SkillTriggerInput, deps: SkillDr
   if (!check.ok) return refuse('check-failed', check.reasons.join(','))
 
   const md = renderSkillMd(check.parts, evidence, today)
+
+  // ---- 门③ draft-quality judgment (N4, spec 增补节) ----
+  const jev = deps.jev
+  if (jev !== undefined && jev.enabled()) {
+    const ref = `skill:${check.parts.name}`
+    const judgment = (await jev
+      .judge({
+        gate: 'draft-quality',
+        state: draftQualityState(check.parts),
+        subjects: [{ ref, instructions: '这份技能草稿质量够格进审批队列吗', criteria: QUALITY_CRITERIA }],
+      })
+      .catch(() => undefined))?.get(ref)
+    if (judgment !== undefined && judgment.band === 'fallback' && judgment.outcome === 'ok') {
+      // The backend ANSWERED 「不够格」 (<0.10): never queued, archived + ledgered.
+      archiveRejectedDraft(md, deps.draftsRoot(), check.parts.name)
+      return refuse('quality-gate', `jev:p=${judgment.probability?.toFixed(2) ?? '?'}`)
+    }
+    // record band → proceeds (kept on the decisions ledger); a call FAILURE
+    // → the structure self-check result is final (jev never blocks the loop).
+  }
+
   const dir = join(deps.draftsRoot(), check.parts.name)
   if (existsSync(dir)) {
     const existing = (() => {

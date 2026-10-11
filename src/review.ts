@@ -25,8 +25,12 @@
  * exists too, the action is refused with a merge hint. Only drafts stamped
  * `source: auto-generated` (our own marker, 红线④) are ever installable.
  *
- * Evidence discipline (红线⑤): summaries are machine-assembled signal counts
- * + feature tokens only — LLM pro/con summaries are wave N4.
+ * Evidence discipline (红线⑤): the machine summary stays counts + feature
+ * tokens; the wave-N4 LLM pro/con upgrade (draftProCon) sends only OUR OWN
+ * draft + the evidence line, caches per id+digest, and falls back to the
+ * machine text verbatim on any failure. The N4 jev gates ride this module:
+ * 门② contradiction warnings on lesson approve, 门④ retire suggestions in
+ * the queue, reject-retire on installed auto skills.
  *
  * @module review
  */
@@ -37,12 +41,15 @@ import { join } from 'node:path'
 import type { CommandDefinition, CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 
 import type { ActionLedger, ReviewAction } from './ledger.ts'
-import type { PeerHandle } from './feed.ts'
+import type { PeerHandle, PeerLessonEntry } from './feed.ts'
 import type { ImproveLoopMode } from './config.ts'
+import { cap, retireSuggestions, type JevGate, type JevJudgment } from './jev-gate.ts'
 import { viewTriggers } from './triggers.ts'
 import {
+  DRAFT_LLM_MODEL,
   defaultDraftsRoot,
   defaultSkillsRoot,
+  draftProCon,
   generateSkillDraft,
   parseSkillMd,
   type LlmFn,
@@ -246,6 +253,37 @@ export function archiveDraft(id: ReviewId, deps: { gate: ImproveLoopMode; drafts
 }
 
 // ---------------------------------------------------------------------------
+// 门④ adjudication (N4): reject on an INSTALLED auto-generated skill = retire
+// (uninstall by archive). Never automatic, never applied to hand-written
+// skills (红线④), always rollback-able (the exact bytes land in .archived).
+// ---------------------------------------------------------------------------
+
+export type RetireOutcome =
+  | { status: 'retired'; dir: string; archiveDir: string }
+  | { status: 'refused'; reason: 'gate' | 'missing-skill' | 'not-ours' }
+
+export function retireInstalledSkill(id: ReviewId, deps: { gate: ImproveLoopMode; skillsRoot: string; draftsRoot: string }): RetireOutcome {
+  if (deps.gate !== 'on') return { status: 'refused', reason: 'gate' }
+  const name = id.slice('skill:'.length)
+  const dir = join(deps.skillsRoot, name)
+  let fm: ParsedSkillMd | undefined
+  try {
+    fm = parseSkillMd(readFileSync(join(dir, 'SKILL.md'), 'utf8'))
+  } catch {
+    return { status: 'refused', reason: 'missing-skill' }
+  }
+  if (fm?.source !== 'auto-generated') return { status: 'refused', reason: 'not-ours' }
+  try {
+    const archiveDir = join(deps.draftsRoot, '.archived', `${name}-${stamp()}-uninstalled`)
+    mkdirSync(join(deps.draftsRoot, '.archived'), { recursive: true })
+    renameSync(dir, archiveDir)
+    return { status: 'retired', dir, archiveDir }
+  } catch {
+    return { status: 'refused', reason: 'missing-skill' }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The command
 // ---------------------------------------------------------------------------
 
@@ -259,15 +297,20 @@ export interface ReviewCommandDeps {
   skillsRoot(): string
   now(): string
   llm?: LlmFn
+  /** The jev layer (N4): 门② contradiction check on lesson approve, and the
+   *  queue's retire-suggestion feed reads its decisions ledger. Undefined or
+   *  disabled layer → every surface behaves exactly as N3 (zero calls). */
+  jev?: JevGate
 }
 
 const HELP = [
   '/improve-review — 审批队列（lesson hint + skill 草稿）',
-  '  无参数                队列列表',
-  '  show <id>             全文 + 证据摘要',
-  '  approve <id>          skill 装机 / lesson hint→established',
-  '  reject <id>           skill 草稿归档 / lesson 移除（removed）',
-  '  draft                 手动起稿：行动账近 7 天信号 → SKILL.md 草稿',
+  '  无参数                队列列表（含 jev 退役复审建议，如有）',
+  '  show <id>             全文 + 证据摘要（LLM 正反方，失败回退机器拼）',
+  '  approve <id>          skill 装机 / lesson hint→established（lesson 固化前过 jev 矛盾检测）',
+  '  reject <id>           skill 草稿归档 / lesson 移除（removed）；',
+  '                        若为已装机的 auto skill（无草稿）→ 退役卸装（归档备份，可回滚）',
+  '  draft                 手动起稿：行动账近 7 天信号 → SKILL.md 草稿（自验门后过 jev 质量门）',
   '  triggers              触发引擎观察面：当前候选与判定依据（只读）',
 ].join('\n')
 
@@ -293,6 +336,111 @@ function seamResultText(ok: boolean | undefined, reason: string | undefined, ver
   return `${verb} 失败：lesson:${slug} — ${why[reason ?? ''] ?? `原仓返回 ${reason ?? 'unknown'}`}`
 }
 
+// ---------------------------------------------------------------------------
+// 门② contradiction detection (N4, spec 增补节): before a hint lesson is
+// solidified to established, the jev layer is asked 「与现有 established
+// lessons 矛盾吗」. adopt (≥0.60) → proceed silently; record (0.10–0.60) or
+// any call failure → the approve PROCEEDS (human already decided — 人审优先)
+// with a warning line. Layer off → zero calls, N3 text byte-identical.
+// ---------------------------------------------------------------------------
+
+const CONTRADICTION_CRITERIA = {
+  true: '不矛盾，可以固化',
+  false: '与现有 established lessons 矛盾（条件或动作冲突）',
+} as const
+
+/** The candidate's distilled fields from the bundle file (features only). */
+function readLessonContent(bundleRoot: string, slug: string): { title?: string; description?: string; conclusion?: string } | undefined {
+  let text: string
+  try {
+    text = readFileSync(join(bundleRoot, 'topics', `${slug}.md`), 'utf8')
+  } catch {
+    return undefined
+  }
+  try {
+    const head = /^---\r?\n([\s\S]*?)\r?\n---/u.exec(text)?.[1] ?? ''
+    const scalar = (key: string): string | undefined => new RegExp(`^${key}: ?(.*)$`, 'mu').exec(head)?.[1]?.trim().replace(/^"([\s\S]*)"$/, '$1')
+    return {
+      ...(scalar('title') !== undefined ? { title: scalar('title') } : {}),
+      ...(scalar('description') !== undefined ? { description: scalar('description') } : {}),
+      ...(scalar('conclusion') !== undefined ? { conclusion: scalar('conclusion') } : {}),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** State text — distilled bundle artifacts only, bounded (红线⑤). */
+export function contradictionState(candidate: { title?: string; description?: string; conclusion?: string }, roster: readonly PeerLessonEntry[]): string {
+  const lines = [
+    'candidate_lesson:',
+    `- title=${cap(candidate.title ?? '-', 120)}`,
+    `- description=${cap(candidate.description ?? '-', 160)}`,
+    `- conclusion=${cap(candidate.conclusion ?? '-', 200)}`,
+    'established_lessons:',
+    ...roster.slice(0, 8).map((l, i) => `${i + 1}. ${l.slug}: ${cap(l.title ?? '', 80)}${l.triggers !== undefined && l.triggers.length > 0 ? ` [${l.triggers.slice(0, 6).join(',')}]` : ''}`),
+  ]
+  return lines.join('\n')
+}
+
+function contradictionWarningText(j: JevJudgment): string {
+  const p = j.probability !== undefined ? `p=${j.probability.toFixed(2)}` : `outcome=${j.outcome}`
+  if (j.band === 'record') return `\n⚠ jev 矛盾检测 record（${p}）：与现有 established lessons 存在一定重叠/张力——approve 仍执行（人审优先），建议复核。`
+  if (j.outcome === 'ok') return `\n⚠ jev 矛盾检测 fallback（${p}）：判定为与现有 established lessons 矛盾——approve 仍执行（人审优先），强烈建议先比对。`
+  return `\n⚠ jev 矛盾检测不可用（${j.outcome}）：本次按纯码放行，建议人工比对现有 established lessons。`
+}
+
+/**
+ * The 门② warning line for an approve, '' when the layer is off/disabled,
+ * the roster is empty (nothing to contradict), the candidate is unreadable,
+ * or the band is adopt. The call itself never blocks the approve (红线②).
+ */
+async function contradictionWarning(slug: string, peer: PeerHandle, deps: ReviewCommandDeps): Promise<string> {
+  const jev = deps.jev
+  if (jev === undefined || !jev.enabled()) return ''
+  const roster = peer.lessons()
+  if (roster.length === 0) return ''
+  const candidate = readLessonContent(deps.bundleRoot(), slug)
+  if (candidate === undefined) return ''
+  const ref = `lesson:${slug}`
+  const judgment = (await jev
+    .judge({
+      gate: 'lesson-contradiction',
+      state: contradictionState(candidate, roster),
+      subjects: [{ ref, instructions: '这条候选 lesson 与现有 established lessons 矛盾吗', criteria: CONTRADICTION_CRITERIA }],
+    })
+    .catch(() => undefined))?.get(ref)
+  return judgment !== undefined && judgment.band !== 'adopt' ? contradictionWarningText(judgment) : ''
+}
+
+// ---------------------------------------------------------------------------
+// 门④ queue feed: still-installed retire suggestions from the decisions ledger
+// ---------------------------------------------------------------------------
+
+function installedCreatedOf(skillsRoot: string, name: string): string | undefined {
+  try {
+    return parseSkillMd(readFileSync(join(skillsRoot, name, 'SKILL.md'), 'utf8'))?.created
+  } catch {
+    return undefined
+  }
+}
+
+/** Suggestions whose skill is STILL installed (a decided one self-clears). */
+function liveRetireSuggestions(deps: ReviewCommandDeps): { name: string; probability?: number; created?: string }[] {
+  const jev = deps.jev
+  if (jev === undefined || !jev.enabled()) return []
+  const skillsRoot = deps.skillsRoot()
+  const out: { name: string; probability?: number; created?: string }[] = []
+  for (const s of retireSuggestions(jev.decisionsFile())) {
+    if (!s.ref.startsWith('skill:')) continue
+    const name = s.ref.slice('skill:'.length)
+    const created = installedCreatedOf(skillsRoot, name)
+    if (created === undefined) continue
+    out.push({ name, ...(s.probability !== undefined ? { probability: s.probability } : {}), created })
+  }
+  return out
+}
+
 export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
   const ledgerReview = (action: ReviewAction, object: string, extra?: { detail?: string; rollback?: string }): void => {
     deps.ledger.append({ at: deps.now(), kind: 'review', gate: deps.gate(), action, object, ...extra })
@@ -301,10 +449,15 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
   const queueSummary = (gate: ImproveLoopMode): string => {
     const drafts = listSkillDrafts(deps.draftsRoot())
     const lessons = listHintLessons(deps.bundleRoot())
-    if (drafts.length === 0 && lessons.length === 0) return '审批队列空。'
-    const lines = [`审批队列（improveLoop=${gate}）${drafts.length + lessons.length} 项：`]
+    const retire = liveRetireSuggestions(deps)
+    if (drafts.length === 0 && lessons.length === 0 && retire.length === 0) return '审批队列空。'
+    const lines = [`审批队列（improveLoop=${gate}）${drafts.length + lessons.length + retire.length} 项：`]
     for (const d of drafts) lines.push(`  ${d.id}  草稿  created=${d.created ?? '?'}  证据: ${d.evidence ?? '-'}`)
     for (const l of lessons) lines.push(`  ${l.id}  hint  ${l.title ?? ''}  scope=${l.scope ?? 'workspace'}`)
+    for (const r of retire) {
+      const p = r.probability !== undefined ? `jev p=${r.probability.toFixed(2)}, ` : ''
+      lines.push(`  skill:${r.name}  退役复审建议（${p}created=${r.created ?? '?'}）— 不自动删除；确认无价值：reject skill:${r.name}（归档卸装，可回滚）`)
+    }
     lines.push('show <id> 看全文；approve <id> / reject <id> 处置。')
     return lines.join('\n')
   }
@@ -366,6 +519,7 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
             'daily-cap': '已达每日草稿上限（每日 ≤1，已落账）',
             'secret-gate': 'secret gate 拦截（已落账，未出网/未落盘）',
             'check-failed': '影子自验未过，不进队列（已落账）',
+            'quality-gate': 'jev 质量门未过（<0.10），不进队列，草稿已归档（已落账）',
             'no-evidence': '行动账近 7 天无信号，无证据可起稿',
             'trigger-declined': '触发引擎未放行（cluster 请求须引擎 BL-3 清关；已落账）',
             'write-failed': '草稿落盘失败（已落账）',
@@ -391,7 +545,21 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
             } catch {
               return { kind: 'error', text: `草稿读取失败：${entry.file}` }
             }
-            return { kind: 'success', text: `${id} 的证据摘要（机器拼，信号计数+来源）：\n  ${entry.evidence ?? '-'}\n\n——— SKILL.md 全文 ———\n${text}` }
+            // 第五增强 (N4): the machine summary stays verbatim; when the
+            // distilled LLM route answers, a pro/con block is inserted before
+            // the full text. Any failure (no credential, timeout, bad shape)
+            // leaves the N3 output byte-identical.
+            const machine = `${id} 的证据摘要（机器拼，信号计数+来源）：\n  ${entry.evidence ?? '-'}`
+            const proCon = await draftProCon({
+              id: id!,
+              ...(entry.evidence !== undefined ? { evidence: entry.evidence } : {}),
+              draftText: text,
+              cacheFile: join(deps.bundleRoot(), 'meta', 'improve-summaries.jsonl'),
+              ...(deps.llm !== undefined ? { llm: deps.llm } : {}),
+              now: deps.now,
+            }).catch(() => undefined)
+            const block = proCon !== undefined ? `\n\nLLM 正反方摘要（${DRAFT_LLM_MODEL}）：\n  正方: ${proCon.pro}\n  反方: ${proCon.con}` : ''
+            return { kind: 'success', text: `${machine}${block}\n\n——— SKILL.md 全文 ———\n${text}` }
           }
           const lesson = listHintLessons(deps.bundleRoot()).find((l) => l.id === id)
           if (lesson === undefined) return { kind: 'error', text: `队列中没有 ${id}` }
@@ -417,11 +585,14 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
               ledgerReview('mutation-degraded', id!, { detail: 'topics-memory-unavailable' })
               return { kind: 'error', text: 'topics-memory 不可用：lessons 回路停摆（§6.3 降级），动作已落账。' }
             }
+            // 门② (N4): 固化前的矛盾检测 — adopt → silent; record/fallback →
+            // warning line, the human's approve still proceeds (人审优先).
+            const warn = approve ? await contradictionWarning(slug, peer, deps).catch(() => '') : ''
             try {
               const actor = `dsh-self-improve:${String(invocation.agent?.id ?? 'manual')}`
               const result = await peer.setLessonStatus(slug, approve ? 'established' : 'removed', { actor })
               ledgerReview(approve ? 'approved' : 'rejected', id!, { rollback: `seam=setLessonStatus to=${approve ? 'established' : 'removed'} slug=${slug} actor=${actor}` })
-              const text = seamResultText(result.ok, result.reason, approve ? 'approve' : 'reject', slug)
+              const text = seamResultText(result.ok, result.reason, approve ? 'approve' : 'reject', slug) + warn
               return result.ok ? { kind: 'success', text } : { kind: 'error', text }
             } catch (e) {
               ledgerReview('mutation-degraded', id!, { detail: `seam-failed:${e instanceof Error ? e.name : 'unknown'}` })
@@ -456,6 +627,14 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
           if (outcome.status === 'archived') {
             ledgerReview('rejected', id!, { rollback: `archived=${outcome.dir}` })
             return { kind: 'success', text: `已拒绝并归档：${id} → ${outcome.dir}` }
+          }
+          // 门④ adjudication (N4): no live draft, but an INSTALLED
+          // auto-generated skill → reject = retire-uninstall (archived copy,
+          // rollback-able). Hand-written skills are refused (绝不碰手写).
+          const retired = retireInstalledSkill(id!, { gate, skillsRoot: deps.skillsRoot(), draftsRoot: deps.draftsRoot() })
+          if (retired.status === 'retired') {
+            ledgerReview('rejected', id!, { rollback: `uninstalled=${retired.dir} archived=${retired.archiveDir}` })
+            return { kind: 'success', text: `已退役并卸装：${id}\n  备份：${retired.archiveDir}（回滚 = 将该目录拷回 ${retired.dir}）` }
           }
           ledgerReview(outcome.reason === 'gate' ? 'mutation-gate-refused' : 'mutation-collision', id!, { detail: outcome.reason })
           return { kind: 'error', text: outcome.reason === 'gate' ? MUTATION_TEXT_SHADOW : `队列中没有 ${id}` }
