@@ -1,7 +1,8 @@
 # dsh-self-improve bundle patch: mounts the plugin under the stable id
-# `dsh-self-improve`. Wave-2 registers here: the improvement-loop config
-# namespace, the /improve-review approval command, the session-signal
-# collector and the skills-draft reviewer.
+# `dsh-self-improve`. Landed: the three-key settings namespace (improveLoop /
+# improveJevBackend / improveJevModel), the session-signal collector, the
+# observation feed and the action ledger. Later waves register here: the
+# /improve-review approval command and the skills-draft reviewer.
 
 - insert:
     - id: dsh-self-improve
