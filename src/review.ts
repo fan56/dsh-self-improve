@@ -666,8 +666,10 @@ export function registerReviewCommand(ctx: unknown, deps: ReviewCommandDeps): vo
         effect?: (fn: () => unknown, label?: string) => unknown
       }
       if (c?.commands === undefined || typeof c.commands.register !== 'function') return
-      const registerFn = c.commands.register
-      const register = () => registerFn(buildReviewCommand(deps))
+      // e2e B1 regression guard: calling the extracted bare function loses the
+      // CommandRuntime receiver (`this.layers` → TypeError, silently eaten by
+      // effect containment) and /improve-review silently never registers.
+      const register = () => c.commands!.register(buildReviewCommand(deps))
       if (typeof c.effect === 'function') c.effect(register, 'improve: /improve-review')
       else void register()
     })
