@@ -164,3 +164,16 @@ src/
 ## 状态（0.1.0）
 
 N1 地基波 + N3 审批/skills 波 + N2 触发引擎波 + N4 jev 决策波已落地：配置三键 + 五信号采集 + 写缝投喂（①②）+ 行动账；`/improve-review` 审批命令（队列/show/approve/reject/draft/triggers）+ skills 草稿生成器（手动 + 引擎清关触发、影子自验门、secret gate、每日 ≤1、装机不覆盖手写/-auto 后缀）；N2 触发引擎（tool-error 聚类 7 天 ≥3 ∧ BL-3 lesson 合取、turn/end 每分钟 ≤1 节流扫描、每日 fire ≤1、would-fire 影子带）+ 打断对快速通道（peer lesson 数据面直构落库、占位 hint pending-refine、每 session ≤3）；N4 jev 增强层（四门：触发聚类判定/矛盾检测/草稿质量门/90 天退役复审，判定账 improve-decisions.jsonl，fail-open 全硬编码，off=零调用零账行纯码逐字节）+ 审批证据 LLM 正反方摘要（蒸馏路由+缓存）+ reject 退役卸装。off 守卫 / 三态门控 / 装机保护 / 红线⑤ / 四门三 band+fail-open 全有测试（110 绿），真宿主 boot-smoke 绿。后续波：占位 hint 冷读提炼（打断对升格）。
+
+## 纯本地模式（不需要 GitHub）
+
+回路的每一环都**不依赖 GitHub**——信号采集在本机 firehose、观察/教训/技能落在本地 bundle 与本地目录、判定账在本地 meta。GitHub 只出现在 topics-memory 的**可选**同步功能里，与回路无关；不配同步（或 onboard 选 local-only）就是彻底的纯本地。回归测试 `test/pure-local.test.mjs` 钉死：无 remote、无 sync 配置的 bundle 上「观察投喂→hint lesson 落库→established」三环全通。
+
+另一台电脑的纯本地装机清单：
+
+1. profile 装 `@aiwayds/dsh-topics-memory`（≥0.24.0）+ `@aiwayds/dsh-self-improve`（均 npm latest）；
+2. profile `cordis.patch.yml` 加挂载条目（`improveLoop: 'on'`；`improveJevBackend` 可留空=纯码判定）；
+3. topics-memory 配好蒸馏模型路由（教训提炼用）；**不配 GitHub 同步**；
+4. zen 钥匙串凭据可选——没有则 jev 门自动 fail-open 退纯码，回路照跑。
+
+注意：本机 bundle 若**已**配 GitHub 同步，回路产出会随包一起同步（私有仓）——要「这份不上去」，就把那台 bundle 用 `/topics onboard` 的 local-only 模式重置。
