@@ -37,6 +37,13 @@ export const USAGE_WINDOW_DAYS = 30
 interface PeerTopicsService {
   feedObservations(obs: readonly StructuredObservation[], opts: { actor: string }): Promise<FeedResult>
   usageSignalsSync(): Map<string, { hits: number; opens: number }>
+  setLessonStatus(slug: string, to: 'established' | 'deprecated' | 'removed', opts: { actor: string }): Promise<StoreResult>
+}
+
+/** Structural view of the peer's StoreResult — only ok/reason are read. */
+export interface StoreResult {
+  ok?: boolean
+  reason?: string
 }
 
 export interface PeerHandle {
@@ -44,6 +51,9 @@ export interface PeerHandle {
   feed(observations: readonly StructuredObservation[]): Promise<FeedResult>
   /** The peer's mtime-cached 30-day usage aggregate (slug → {hits, opens}). */
   usageSignals(): Map<string, { hits: number; opens: number }>
+  /** Method ② (spec §6.2, wave N3) — lesson status flips through the peer's
+   *  store lock + index recompute; this repo never writes bundle files. */
+  setLessonStatus(slug: string, to: 'established' | 'deprecated' | 'removed', opts: { actor: string }): Promise<StoreResult>
 }
 
 export type FeedOutcome =
@@ -141,6 +151,7 @@ export async function openPeerHandle(): Promise<PeerHandle | undefined> {
     return {
       feed: (observations) => service.feedObservations(observations, { actor: 'dsh-self-improve' }),
       usageSignals: () => service.usageSignalsSync(),
+      setLessonStatus: (slug, to, opts) => service.setLessonStatus(slug, to, opts),
     }
   } catch {
     return undefined

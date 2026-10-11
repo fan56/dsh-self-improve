@@ -1,30 +1,37 @@
 /**
  * dsh-self-improve — the self-improvement loop for dsh (spec 卷二 is the
- * contract; wave N1 lays the foundation: config keys + signal collectors +
- * observation feed + the action ledger).
+ * contract; wave N1 laid the foundation, wave N3 adds the approval CLI +
+ * the skills asset loop).
  *
- * Wave-N1 shape:
+ * Wave-N3 shape:
  *   settings (`dsh-self-improve` namespace, three volatile keys)
  *     └─ improveLoop: off | shadow | on   ← the loop master gate
+ *   /improve-review (human-initiated, registered under EVERY gate):
+ *     queue list / show / approve / reject / manual draft
  *   session firehose ──▶ SignalCollector ──▶ per-turn-end batch
  *     ├─ shadow: meta/improve-actions.jsonl only (never fed)
  *     └─ on:     action ledger AND feedObservations into topics-memory
  *   periodic (once per session, dsh-cron-friendly):
  *     unused-injection snapshot from the peer's usage aggregate
  *
- * Gate semantics (spec §7 MJ-A, enforced here):
- *   off    — apply() returns before ANY listener registration: the host's
- *            behavior is byte-for-byte stock (pinned by the off-guard test).
- *            Arming from a boot-time off needs a reload.
+ * Gate semantics (spec §7 MJ-A + the wave-N3 refinement for the human
+ * surface):
+ *   off    — zero firehose listeners (byte-for-byte host behavior, pinned by
+ *            the off-guard test); arming from a boot-time off needs a reload.
+ *            /improve-review stays available (it acts only when a human
+ *            invokes it) but its queue is suppressed, draft generation is
+ *            refused + ledgered, and mutations are refused.
  *   shadow — collectors subscribe; observations land in the ledger only.
- *   on     — collectors subscribe; observations are fed and ledgered.
- *   shadow↔on flips are hot (volatile refs re-read per event); a flip INTO
- *   off mid-session makes the already-registered listeners inert (they
- *   re-check the gate before every action) but keeps them attached.
+ *            Draft generation + self-check run; effecting mutations (skill
+ *            install / lesson status flips) are refused.
+ *   on     — everything.
+ *   Skill install is ALWAYS human-review (no automatic path); shadow↔on
+ *   flips are hot; a flip INTO off mid-session makes the listeners inert.
  *
  * Failure posture (red line ②, hard-coded, no key): every lane here is
- * async, fire-and-forget, and swallows its own errors; a broken feed or a
- * broken ledger at most costs telemetry, never session function.
+ * async, fire-and-forget, and swallows its own errors; a broken feed, a
+ * broken ledger or a broken command at most costs telemetry, never session
+ * function.
  *
  * @module index
  */
@@ -34,9 +41,11 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { StructuredObservation } from '@aiwayds/dsh-topics-memory'
 
-import { normalizeImproveLoop, readConfigValue, snapshotConfig, SelfImproveConfig, type SelfImproveRuntimeConfig } from './config.ts'
+import { normalizeImproveLoop, readConfigValue, snapshotConfig, SelfImproveConfig, type SelfImproveConfigValue, type SelfImproveRuntimeConfig } from './config.ts'
 import { openPeerHandle, resolveImproveBundleRoot, unusedInjectionObservations, type PeerHandle } from './feed.ts'
 import { ActionLedger } from './ledger.ts'
+import { registerReviewCommand, type ReviewCommandDeps } from './review.ts'
+import { defaultDraftsRoot, defaultSkillsRoot } from './skill-draft.ts'
 import { SignalCollector } from './signals.ts'
 
 export const name = 'dsh-self-improve'
@@ -49,6 +58,13 @@ export interface LoopDeps {
   openPeer(): Promise<PeerHandle | undefined>
   bundleRoot(): string
   now(): string
+  /** Skill-drafts area (defaults to ~/.dsh/skills-drafts). */
+  draftsRoot?(): string
+  /** Install target (defaults to ~/.dsh/skills). */
+  skillsRoot?(): string
+  /** LLM override for draft generation (tests mock it; default is the
+   *  verified bigmodel route — skill-draft.bigmodelLlm). */
+  llm?: ReviewCommandDeps['llm']
 }
 
 const defaultDeps: LoopDeps = {
@@ -63,24 +79,44 @@ interface HostLike {
 }
 
 export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeConfig = {}, deps: LoopDeps = defaultDeps): Promise<void> {
-  // The off-guard: resolve the gate FIRST and return before any listener,
-  // any peer probe, any filesystem touch — the guard test pins "zero
-  // listeners after apply".
-  const initialGate = normalizeImproveLoop(readConfigValue(config.improveLoop))
-  if (initialGate === 'off') return
-
   const host = ctx as unknown as HostLike
-  // Volatile hot path: every event re-snapshots the live refs, so a
-  // settings-page shadow↔on flip lands on the next turn end.
-  const cfgNow = () => snapshotConfig(config)
-  const ledger = new ActionLedger(join(deps.bundleRoot(), 'meta', 'improve-actions.jsonl'))
-  const nowIso = () => deps.now()
+  // Volatile hot path: every event/invocation re-snapshots the live refs, so
+  // a settings-page flip lands on the next turn end or command call.
+  const cfgNow = (): SelfImproveConfigValue => snapshotConfig(config)
+  // Lazy ledger path: resolved at first append, so an off boot (or any boot
+  // without a review action) never touches the bundle root (off-guard probe).
+  const ledgerFile = (): string => join(deps.bundleRoot(), 'meta', 'improve-actions.jsonl')
+  const ledger = new ActionLedger(ledgerFile)
+  const nowIso = (): string => deps.now()
 
   // Peer handle: created lazily on first use, at most once per process.
   // undefined (peer absent / unloadable) is a STICKY outcome — spec §6.3:
-  // the loop degrades to ledger-only, no retry storm, no补投.
+  // the loop degrades to ledger-only, no retry storm, no补投. Declared
+  // BEFORE the off-guard return: /improve-review survives an off boot, so a
+  // settings-page flip to on must find the seam (the guard test still pins
+  // zero peer probes during apply — laziness is the point).
   let peerPromise: Promise<PeerHandle | undefined> | undefined
   const peerOf = (): Promise<PeerHandle | undefined> => (peerPromise ??= deps.openPeer())
+
+  // ---- /improve-review (all gates; human-initiated surface) ----
+  // Registration must not probe the peer or the filesystem — everything
+  // inside the handler resolves lazily per invocation.
+  const reviewDeps: ReviewCommandDeps = {
+    gate: () => normalizeImproveLoop(cfgNow().improveLoop),
+    ledger,
+    openPeer: () => peerOf(),
+    bundleRoot: () => deps.bundleRoot(),
+    draftsRoot: () => (deps.draftsRoot !== undefined ? deps.draftsRoot() : defaultDraftsRoot()),
+    skillsRoot: () => (deps.skillsRoot !== undefined ? deps.skillsRoot() : defaultSkillsRoot()),
+    now: nowIso,
+    ...(deps.llm !== undefined ? { llm: deps.llm } : {}),
+  }
+  registerReviewCommand(host, reviewDeps)
+
+  // The off-guard: return before ANY firehose listener, any peer probe, any
+  // filesystem touch — the guard test pins "zero listeners after apply".
+  const initialGate = normalizeImproveLoop(readConfigValue(config.improveLoop))
+  if (initialGate === 'off') return
 
   /** Degradation ledger throttle: once per key (per session / per periodic lane). */
   const degradedKeys = new Set<string>()
@@ -211,3 +247,5 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
   }
 }
 
+// defaultDraftsRoot/defaultSkillsRoot re-exports for tests/diagnostics.
+export { defaultDraftsRoot, defaultSkillsRoot } from './skill-draft.ts'
