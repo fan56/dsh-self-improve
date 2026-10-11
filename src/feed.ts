@@ -33,17 +33,44 @@ export const UNUSED_INJECTION_SLUG_CAP = 20
 /** The usage-signal window of the B1 #3 rule, in days. */
 export const USAGE_WINDOW_DAYS = 30
 
-/** The exact TopicsService surface this repo drives — nothing more. */
+/** The exact TopicsService surface this repo drives — nothing more. The
+ *  N2-added members are optional: a runtime peer older than 0.25.0 lacks
+ *  them, and the handles degrade (empty roster / seam-unavailable) instead
+ *  of breaking the loop lane (红线②). */
 interface PeerTopicsService {
   feedObservations(obs: readonly StructuredObservation[], opts: { actor: string }): Promise<FeedResult>
   usageSignalsSync(): Map<string, { hits: number; opens: number }>
   setLessonStatus(slug: string, to: 'established' | 'deprecated' | 'removed', opts: { actor: string }): Promise<StoreResult>
+  /** 0.25.0+: the established-lesson roster (MJ-3 semantics — hints never
+   *  appear here). File-level reads behind an mtime cache; read-only. */
+  lessonsSync?(): unknown[]
+  /** 0.25.0+: the lesson data plane of the topic_save seam. The N2 fast
+   *  lane pins kind/confidence/lessonSource itself. */
+  saveTopic?(input: Record<string, unknown>): Promise<{ slug?: string }>
 }
 
 /** Structural view of the peer's StoreResult — only ok/reason are read. */
 export interface StoreResult {
   ok?: boolean
   reason?: string
+}
+
+/** The slice of an established lesson the BL-3 word-face check reads. */
+export interface PeerLessonEntry {
+  slug: string
+  title?: string
+  triggers?: string[]
+  /** 30-day injection telemetry annotation (ilog hits/opens), if any. */
+  hits?: number
+  opens?: number
+}
+
+/** The fast-lane save request — whitelist fields only, no conversation text. */
+export interface PeerSaveLessonInput {
+  title: string
+  description?: string
+  conclusion?: string
+  triggers?: string[]
 }
 
 export interface PeerHandle {
@@ -54,6 +81,14 @@ export interface PeerHandle {
   /** Method ② (spec §6.2, wave N3) — lesson status flips through the peer's
    *  store lock + index recompute; this repo never writes bundle files. */
   setLessonStatus(slug: string, to: 'established' | 'deprecated' | 'removed', opts: { actor: string }): Promise<StoreResult>
+  /** Established lessons only (the BL-3 related-lesson check reads this; a
+   *  peer without lessonsSync degrades to an empty roster, which the BL-3
+   *  conjunction treats as the blind-spot branch — §6.3). */
+  lessons(): PeerLessonEntry[]
+  /** B2 决议 3② fast lane: create a hint lesson through the peer's lesson
+   *  data plane (kind:'lesson', confidence:'hint', scope:'workspace',
+   *  lessonSource:'correction' pinned HERE — the caller cannot widen it). */
+  saveLesson(input: PeerSaveLessonInput): Promise<{ ok: boolean; slug?: string }>
 }
 
 export type FeedOutcome =
@@ -148,13 +183,63 @@ export async function openPeerHandle(): Promise<PeerHandle | undefined> {
     }
     const store = new storeMod.BundleStore(resolveImproveBundleRoot())
     const service = new serviceMod.TopicsService(store, TOPICS_SERVICE_VIEW)
+    // 0.25.0+ members are probed, not assumed — an older runtime peer keeps
+    // every other lane alive (optional-peer degradation, 红线②).
+    const roster = (): PeerLessonEntry[] => {
+      if (typeof service.lessonsSync !== 'function') return []
+      const usage = safeUsage(service)
+      try {
+        return (service.lessonsSync() ?? []).map((raw) => {
+          const e = raw as { slug?: unknown; title?: unknown; triggers?: unknown }
+          const slug = typeof e.slug === 'string' ? e.slug : ''
+          if (slug === '') return undefined
+          const u = usage.get(slug)
+          return {
+            slug,
+            ...(typeof e.title === 'string' && e.title !== '' ? { title: e.title.slice(0, 200) } : {}),
+            ...(Array.isArray(e.triggers) ? { triggers: e.triggers.filter((t): t is string => typeof t === 'string').slice(0, 16) } : {}),
+            ...(u !== undefined ? { hits: u.hits, opens: u.opens } : {}),
+          }
+        }).filter((e): e is PeerLessonEntry => e !== undefined)
+      } catch {
+        return []
+      }
+    }
     return {
       feed: (observations) => service.feedObservations(observations, { actor: 'dsh-self-improve' }),
       usageSignals: () => service.usageSignalsSync(),
       setLessonStatus: (slug, to, opts) => service.setLessonStatus(slug, to, opts),
+      lessons: roster,
+      saveLesson: async (input) => {
+        if (typeof service.saveTopic !== 'function') return { ok: false }
+        try {
+          const r = await service.saveTopic({
+            title: input.title,
+            ...(input.description !== undefined ? { description: input.description } : {}),
+            ...(input.conclusion !== undefined ? { conclusion: input.conclusion } : {}),
+            ...(input.triggers !== undefined ? { triggers: input.triggers } : {}),
+            kind: 'lesson',
+            scope: 'workspace',
+            confidence: 'hint',
+            lessonSource: 'correction',
+          })
+          return { ok: true, ...(typeof r.slug === 'string' ? { slug: r.slug } : {}) }
+        } catch {
+          return { ok: false }
+        }
+      },
     }
   } catch {
     return undefined
+  }
+}
+
+/** usageSignalsSync is older than lessonsSync; tolerate either being odd. */
+function safeUsage(service: PeerTopicsService): Map<string, { hits: number; opens: number }> {
+  try {
+    return service.usageSignalsSync() ?? new Map()
+  } catch {
+    return new Map()
   }
 }
 

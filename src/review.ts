@@ -9,6 +9,8 @@
  *   /improve-review reject <id>    skill → archive the draft under .archived/
  *                                  lesson → peer setLessonStatus(slug,'removed')
  *   /improve-review draft          manual trigger: last-7d ledger signals → draft
+ *   /improve-review triggers       trigger-engine dry run: candidates + judgment
+ *                                  basis, read-only (wave N2)
  *
  * Gate semantics (task N3, refining spec §7 MJ-A for the human surface):
  *   off    — the command IS registered (human-initiated only), but the queue
@@ -37,6 +39,7 @@ import type { CommandDefinition, CommandInvocation, CommandResult } from '@deeps
 import type { ActionLedger, ReviewAction } from './ledger.ts'
 import type { PeerHandle } from './feed.ts'
 import type { ImproveLoopMode } from './config.ts'
+import { viewTriggers } from './triggers.ts'
 import {
   defaultDraftsRoot,
   defaultSkillsRoot,
@@ -265,10 +268,18 @@ const HELP = [
   '  approve <id>          skill 装机 / lesson hint→established',
   '  reject <id>           skill 草稿归档 / lesson 移除（removed）',
   '  draft                 手动起稿：行动账近 7 天信号 → SKILL.md 草稿',
+  '  triggers              触发引擎观察面：当前候选与判定依据（只读）',
 ].join('\n')
 
 const MUTATION_TEXT_SHADOW = 'improveLoop=shadow：生效动作（装机 / lesson 状态变更）被拒绝；切 on 后重试。'
 const MUTATION_TEXT_OFF = 'improveLoop=off：回路关闭，队列与处置不可用。'
+
+const TRIGGER_REASON_TEXT: Record<string, string> = {
+  'bl3-no-lesson': '无相关 established lesson → BL-3 盲区直通分支',
+  'bl3-lesson-recurring': '相关 established lesson 在批准后仍复发 → 升级分支',
+  'bl3-lesson-holds': '相关 established lesson 批准后窗口内无复发 → 抑制（lesson 治得住）',
+  'already-fired-today': '今日已 fire 过（每日 ≤1）→ 候选记入，fire 抑制',
+}
 
 /** Map a peer StoreResult to a user-facing line (reason codes only). */
 function seamResultText(ok: boolean | undefined, reason: string | undefined, verb: string, slug: string): string {
@@ -301,7 +312,7 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
   return {
     name: 'improve-review',
     description: '自我改进审批队列：审阅/批准/拒绝 skill 草稿与 lesson hint',
-    input: { hint: '空=队列 | show|approve|reject <id> | draft' },
+    input: { hint: '空=队列 | show|approve|reject <id> | draft | triggers' },
     handler: async (invocation: CommandInvocation): Promise<CommandResult> => {
       try {
         const gate = deps.gate()
@@ -311,6 +322,31 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
         if (sub === '' || sub === 'help' || sub === 'list') {
           if (gate === 'off') return { kind: 'success', text: `improveLoop=off：队列为空（回路关闭；generate/approve 均不可用）。\n${HELP}` }
           return { kind: 'success', text: `${queueSummary(gate)}\n${HELP}` }
+        }
+
+        if (sub === 'triggers') {
+          // The engine's observation surface: read-only dry run, every gate
+          // above off (human-initiated reads don't violate the off guard).
+          if (gate === 'off') return { kind: 'error', text: MUTATION_TEXT_OFF }
+          const view = await viewTriggers({
+            ledgerFile: () => join(deps.bundleRoot(), 'meta', 'improve-actions.jsonl'),
+            openPeer: () => deps.openPeer(),
+            now: deps.now,
+          })
+          const lines = [`触发引擎（improveLoop=${gate}，窗口 ${view.windowDays} 天 / 阈值 ${view.threshold}，今日已 fire：${view.spentToday ? '是' : '否'}）`]
+          if (view.candidates.length === 0) {
+            lines.push('当前无候选（无同类失败聚簇达到阈值）。')
+          }
+          for (const c of view.candidates) {
+            lines.push(`候选 ${c.key} ×${c.count}（最近 ${c.lastAt}）`)
+            lines.push(`  判定：${TRIGGER_REASON_TEXT[c.reason] ?? c.reason} → ${c.wouldFire ? 'would-fire' : 'no-fire'}${gate === 'shadow' && c.wouldFire ? '（shadow：只记 would-fire 账，不产草稿）' : ''}`)
+            for (const r of c.related) {
+              const usage = r.hits !== undefined ? `，30 天注入 hits=${r.hits}/opens=${r.opens ?? 0}` : ''
+              lines.push(`  相关 established lesson：${r.slug}${usage}`)
+            }
+          }
+          lines.push('（判定依据 = 行动账信号聚簇 + peer established lesson roster 词面交集 + 账内批准时间；无写动作）')
+          return { kind: 'success', text: lines.join('\n') }
         }
 
         if (sub === 'draft') {
@@ -331,7 +367,7 @@ export function buildReviewCommand(deps: ReviewCommandDeps): CommandDefinition {
             'secret-gate': 'secret gate 拦截（已落账，未出网/未落盘）',
             'check-failed': '影子自验未过，不进队列（已落账）',
             'no-evidence': '行动账近 7 天无信号，无证据可起稿',
-            'trigger-declined': '触发引擎未放行（N2 前桩恒拒）',
+            'trigger-declined': '触发引擎未放行（cluster 请求须引擎 BL-3 清关；已落账）',
             'write-failed': '草稿落盘失败（已落账）',
             collision: '同名草稿非本插件产物，拒绝覆盖（已落账）',
             'llm-failed': 'LLM 调用失败（fail-open，已落账）',

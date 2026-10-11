@@ -4,13 +4,13 @@
  * `~/.dsh/skills-drafts/<name>/SKILL.md` (isolated from hand-written skills).
  *
  * Triggers (spec §4.1, BL-3 revised):
- *   - `cluster` — the N2 trigger engine's input shape, STUBBED here: the
- *     clustering (same-class failures ≥3 over the 7d window ∧ lesson blind
- *     spot ∨ established-but-recurring) is wave N2; the stub always declines
- *     with `trigger-engine-pending-n2` so the interface is pinned, not guessed.
+ *   - `cluster` — the N2 trigger engine's input shape: only requests the
+ *     engine (triggers.ts) CLEARED — full BL-3 conjunction passed — reach the
+ *     generation path; uncleared cluster requests decline with
+ *     `cluster-not-cleared` so the lane alone stays incapable of auto drafts.
  *   - `manual`  — `/improve-review draft`: the LAST 7 DAYS of `signal` lines
  *     from the action ledger become the evidence, so the whole loop is
- *     verifiable on a real machine before N2 exists.
+ *     verifiable on a real machine without waiting for a cluster.
  *
  * Red lines enforced in this module:
  *   ③ secret gate — the FULL outbound LLM body is scanned against the local
@@ -211,7 +211,12 @@ export interface SkillTriggerInput {
   kind: 'cluster' | 'manual'
   /** Feature-only observations backing the request (never conversation text). */
   evidence: readonly EvidenceSignal[]
-  /** Free-form trigger metadata is NOT part of the shape — extend the union in N2. */
+  /** N2 union extension: cluster context. Only the trigger engine (triggers.ts)
+   *  stamps `cleared: true` — after the full BL-3 conjunction passed. A cluster
+   *  request without engine clearance is declined, so the draft lane alone can
+   *  never be talked into an automatic draft (the N1 stub's safety property,
+   *  preserved). */
+  cluster?: { key: string; count: number; cleared: boolean }
 }
 
 export interface TriggerDecision {
@@ -220,16 +225,17 @@ export interface TriggerDecision {
 }
 
 /**
- * The N2 trigger engine seam. The BL-3 condition — same-class failures ≥3 in
- * the 7d window ∧ (no related lesson ∨ established lesson still recurring) —
- * lands with wave N2; the stub declines every cluster request so nothing can
- * look triggered before the engine exists (spec §4.1: 离线批处理执行位, 永
- * 不在会话热路径). Manual requests bypass this function entirely: a human
- * asked, and the draft gate + review gate still apply.
+ * The cluster-lane decision, N2 edition: manual passes (a human asked);
+ * a cluster request needs engine clearance AND the threshold count. The
+ * BL-3 conjunction itself (clustering + lesson word-face + recurrence) lives
+ * in triggers.ts — this guard only re-verifies what the engine stamped.
  */
-export function evaluateSkillTrigger(input: SkillTriggerInput, _opts: { windowDays: number; threshold: number }): TriggerDecision {
+export function evaluateSkillTrigger(input: SkillTriggerInput, opts: { windowDays: number; threshold: number }): TriggerDecision {
   if (input.kind === 'manual') return { triggered: true, reason: 'manual' }
-  return { triggered: false, reason: 'trigger-engine-pending-n2' }
+  const c = input.cluster
+  if (c === undefined || c.cleared !== true) return { triggered: false, reason: 'cluster-not-cleared' }
+  if (c.count < opts.threshold) return { triggered: false, reason: 'cluster-below-threshold' }
+  return { triggered: true, reason: 'cluster-bl3-passed' }
 }
 
 // ---------------------------------------------------------------------------

@@ -64,6 +64,44 @@ export type ActionLedgerEntry =
       /** Rollback pointer: a path or a git-able seam reference. */
       rollback?: string
     }
+  | {
+      at: string
+      kind: 'trigger'
+      gate: 'shadow' | 'on'
+      /** The engine actually called the draft lane (gate=on only). */
+      fired: boolean
+      /** The BL-3 conjunction passed. shadow rows are the would-fire band:
+       *  engine computed a fire that the gate suppressed. */
+      wouldFire: boolean
+      /** Cluster key `toolName/code` (the errorCode, errorName fallback). */
+      key: string
+      /** Cluster size inside the window. */
+      count: number
+      /** Closed reason vocabulary — machine codes, never text. */
+      reason: TriggerReason
+      /** Related established lesson slugs examined for the BL-3 branch. */
+      relatedLessons?: string[]
+    }
+  | {
+      at: string
+      kind: 'hint'
+      gate: 'on'
+      sessionId: string
+      action: 'created' | 'cap-refused' | 'seam-unavailable' | 'seam-failed'
+      slug?: string
+      turn?: number
+    }
+
+/** The trigger-engine decision codes (N2). Closed set — the account's schema. */
+export type TriggerReason =
+  /** BL-3 blind-spot branch: no related established lesson. */
+  | 'bl3-no-lesson'
+  /** Established lesson exists AND failures still recur after its approval. */
+  | 'bl3-lesson-recurring'
+  /** Established lesson exists and the window shows no post-approval failure. */
+  | 'bl3-lesson-holds'
+  /** A fire already happened today (daily ≤1) — candidate recorded, suppressed. */
+  | 'already-fired-today'
 
 /**
  * The review/accounting action codes (wave N3). A closed set — the account's

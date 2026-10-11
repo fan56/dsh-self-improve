@@ -1,16 +1,22 @@
 /**
  * dsh-self-improve — the self-improvement loop for dsh (spec 卷二 is the
- * contract; wave N1 laid the foundation, wave N3 adds the approval CLI +
- * the skills asset loop).
+ * contract; wave N1 the foundation, N3 the approval CLI + skills asset
+ * loop, N2 the trigger engine + interruption fast lane).
  *
- * Wave-N3 shape:
+ * Wave-N2 shape:
  *   settings (`dsh-self-improve` namespace, three volatile keys)
  *     └─ improveLoop: off | shadow | on   ← the loop master gate
  *   /improve-review (human-initiated, registered under EVERY gate):
- *     queue list / show / approve / reject / manual draft
+ *     queue list / show / approve / reject / manual draft / triggers
  *   session firehose ──▶ SignalCollector ──▶ per-turn-end batch
  *     ├─ shadow: meta/improve-actions.jsonl only (never fed)
  *     └─ on:     action ledger AND feedObservations into topics-memory
+ *                 + interruption-pair → immediate placeholder hint lesson
+ *                   (peer lesson data plane, ≤3 per session, B2 决议 3②)
+ *   turn/end ──▶ trigger-engine scan (≤1 per session per minute):
+ *     cluster tool-errors (toolName+code, 7d ≥3) ∧ BL-3 lesson check →
+ *     shadow: would-fire ledger rows only; on: fire the N3 draft lane
+ *     (daily ≤1). off: the engine never runs, zero reads.
  *   periodic (once per session, dsh-cron-friendly):
  *     unused-injection snapshot from the peer's usage aggregate
  *
@@ -22,8 +28,10 @@
  *            invokes it) but its queue is suppressed, draft generation is
  *            refused + ledgered, and mutations are refused.
  *   shadow — collectors subscribe; observations land in the ledger only.
- *            Draft generation + self-check run; effecting mutations (skill
- *            install / lesson status flips) are refused.
+ *            Draft generation + self-check run; the engine computes and
+ *            records would-fire rows but nothing fires; no hint drafts.
+ *            Effecting mutations (skill install / lesson status flips) are
+ *            refused.
  *   on     — everything.
  *   Skill install is ALWAYS human-review (no automatic path); shadow↔on
  *   flips are hot; a flip INTO off mid-session makes the listeners inert.
@@ -45,8 +53,9 @@ import { normalizeImproveLoop, readConfigValue, snapshotConfig, SelfImproveConfi
 import { openPeerHandle, resolveImproveBundleRoot, unusedInjectionObservations, type PeerHandle } from './feed.ts'
 import { ActionLedger } from './ledger.ts'
 import { registerReviewCommand, type ReviewCommandDeps } from './review.ts'
-import { defaultDraftsRoot, defaultSkillsRoot } from './skill-draft.ts'
+import { defaultDraftsRoot, defaultSkillsRoot, generateSkillDraft } from './skill-draft.ts'
 import { SignalCollector } from './signals.ts'
+import { createInterruptionHint, SCAN_THROTTLE_MS, scanTriggers } from './triggers.ts'
 
 export const name = 'dsh-self-improve'
 
@@ -65,6 +74,9 @@ export interface LoopDeps {
   /** LLM override for draft generation (tests mock it; default is the
    *  verified bigmodel route — skill-draft.bigmodelLlm). */
   llm?: ReviewCommandDeps['llm']
+  /** Monotonic-ish clock for the per-session scan throttle (tests inject a
+   *  stepping counter; default wall clock). */
+  monoNow?(): number
 }
 
 const defaultDeps: LoopDeps = {
@@ -173,7 +185,57 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
       void feedBatch(gate, sessionId ?? 'periodic', observations).catch(() => {
         // Contained: the ledger inside feedBatch already recorded what it could.
       })
+      // The interruption fast lane (B2 决议 3②): immediate, gate=on only —
+      // shadow stops here (the signal line above IS its ledger band).
+      if (sessionId !== undefined) {
+        for (const o of observations) {
+          if (o.type !== 'interruption-pair') continue
+          const turn = typeof o.detail?.turn === 'number' ? o.detail.turn : undefined
+          const trigger = typeof o.detail?.trigger === 'string' ? o.detail.trigger : 'aborted'
+          void createInterruptionHint(sessionId, turn, trigger, {
+            gate: () => normalizeImproveLoop(cfgNow().improveLoop),
+            ledger,
+            ledgerFile,
+            openPeer: () => peerOf(),
+            now: nowIso,
+          }).catch(() => {
+            // Contained: refusals ledger themselves; a crash here costs one hint.
+          })
+        }
+      }
     }
+  }
+
+  // ---- N2 trigger engine: per-turn-end scans, ≤1 per session per minute ----
+  const scanThrottle = new Map<string, number>()
+  const monoNow = (): number => (deps.monoNow !== undefined ? deps.monoNow() : Date.now())
+  // The cluster lane's fire step is the N3 draft generator with THIS plugin's
+  // own draft deps — the engine only clears inputs, the lane keeps its gates.
+  const draftDeps = {
+    gate: () => normalizeImproveLoop(cfgNow().improveLoop),
+    ledger,
+    ledgerFile,
+    draftsRoot: () => (deps.draftsRoot !== undefined ? deps.draftsRoot() : defaultDraftsRoot()),
+    now: nowIso,
+    ...(deps.llm !== undefined ? { llm: deps.llm } : {}),
+  }
+  const maybeScanTriggers = (sessionId: string): void => {
+    // off = the engine never runs, not even a ledger read (zero-read guard).
+    if (normalizeImproveLoop(cfgNow().improveLoop) === 'off') return
+    const t = monoNow()
+    const last = scanThrottle.get(sessionId)
+    if (last !== undefined && t - last < SCAN_THROTTLE_MS) return
+    scanThrottle.set(sessionId, t)
+    void scanTriggers({
+      gate: () => normalizeImproveLoop(cfgNow().improveLoop),
+      ledger,
+      ledgerFile,
+      openPeer: () => peerOf(),
+      now: nowIso,
+      generate: (input) => generateSkillDraft(input, draftDeps),
+    }).catch(() => {
+      // Contained: a broken scan costs one engine tick, never the session.
+    })
   }
 
   /** The periodic (non-firehose) signal: unused-injection snapshot. */
@@ -212,6 +274,9 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
           // Contained.
         })
       }
+      // The N2 trigger engine scan: every turn end, throttled to one scan
+      // per session per minute; off = zero reads.
+      maybeScanTriggers(sessionId)
     },
   })
 
@@ -240,6 +305,7 @@ export async function apply(ctx: Context | HostLike, config: SelfImproveRuntimeC
         collector.disposeSession(sessionId)
         checkedSessions.delete(sessionId)
         degradedKeys.delete(sessionId)
+        scanThrottle.delete(sessionId)
       } catch {
         // Contained.
       }

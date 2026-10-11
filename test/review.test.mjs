@@ -145,12 +145,21 @@ test('scanSecrets: generic shapes and credentials-ref values block', () => {
   }
 })
 
-test('trigger stub: cluster requests always decline until N2, manual passes', () => {
+test('trigger decision: cluster needs engine clearance, manual passes (N2)', () => {
   const evidence = [{ type: 'tool-error', at: NOW(), detail: { toolName: 'bash', errorCode: 'E1' } }]
+  // Uncleared cluster requests decline — the lane alone cannot auto-draft.
   assert.deepEqual(evaluateSkillTrigger({ kind: 'cluster', evidence }, { windowDays: 7, threshold: 3 }), {
     triggered: false,
-    reason: 'trigger-engine-pending-n2',
+    reason: 'cluster-not-cleared',
   })
+  assert.deepEqual(
+    evaluateSkillTrigger({ kind: 'cluster', evidence, cluster: { key: 'bash/E1', count: 2, cleared: true } }, { windowDays: 7, threshold: 3 }),
+    { triggered: false, reason: 'cluster-below-threshold' },
+  )
+  assert.deepEqual(
+    evaluateSkillTrigger({ kind: 'cluster', evidence, cluster: { key: 'bash/E1', count: 4, cleared: true } }, { windowDays: 7, threshold: 3 }),
+    { triggered: true, reason: 'cluster-bl3-passed' },
+  )
   assert.deepEqual(evaluateSkillTrigger({ kind: 'manual', evidence }, { windowDays: 7, threshold: 3 }), { triggered: true, reason: 'manual' })
 })
 
