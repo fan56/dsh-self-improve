@@ -1,0 +1,8 @@
+# dsh-self-improve bundle patch: mounts the plugin under the stable id
+# `dsh-self-improve`. Wave-2 registers here: the improvement-loop config
+# namespace, the /improve-review approval command, the session-signal
+# collector and the skills-draft reviewer.
+
+- insert:
+    - id: dsh-self-improve
+      name: '@aiwayds/dsh-self-improve'
