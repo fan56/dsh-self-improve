@@ -107,6 +107,10 @@ test('ON: feeds the real peer AND ledgers the accepted/rejected outcome', async 
     const obs = lines(observationsFile).filter((o) => o.source === 'fed')
     assert.ok(obs.every((o) => o.kind === 'signal'), 'fed observations carry kind signal')
     assert.ok(obs.every((o) => o.by === 'dsh-self-improve'), 'provenance actor stamped')
+    // The feed line lands after the observations flush — on a slow CI runner
+    // the ledger write can trail the `fed` waitFor above (seen as a red first
+    // run, green rerun on 2026-11-03), so wait for it instead of racing it.
+    assert.ok(await waitFor(() => lines(join(home, 'meta', 'improve-actions.jsonl')).filter((e) => e.kind === 'feed').length >= 1), 'feed line ledgered')
     const actions = lines(join(home, 'meta', 'improve-actions.jsonl'))
     const feeds = actions.filter((e) => e.kind === 'feed')
     assert.equal(feeds.length, 1, 'one feed line per turn batch (per-turn cadence)')
