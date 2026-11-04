@@ -158,9 +158,11 @@ jobs:
       - name: Verify the publish actually landed
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-                    # First publish propagates through npm's CDN for minutes; the
-          # 30s window once failed a release that HAD landed. Budget 5 min.
-          for attempt in $(seq 1 30); do
+          # First publish propagates through npm's CDN for minutes; the 30s
+          # window once failed a release that HAD landed, and on 2026-11-04
+          # even the 5-min budget expired while the publish HAD landed (the
+          # registry served 404 for 6+ minutes). Budget 10 min.
+          for attempt in $(seq 1 60); do
             if npm view "@aiwayds/dsh-self-improve@${TAG_VERSION}" version >/dev/null 2>&1; then
               echo "verified: @aiwayds/dsh-self-improve@${TAG_VERSION} is visible on the registry (attempt ${attempt})"
               exit 0
