@@ -177,3 +177,7 @@ N1 地基波 + N3 审批/skills 波 + N2 触发引擎波 + N4 jev 决策波已�
 4. zen 钥匙串凭据可选——没有则 jev 门自动 fail-open 退纯码，回路照跑。
 
 注意：本机 bundle 若**已**配 GitHub 同步，回路产出会随包一起同步（私有仓）——要「这份不上去」，就把那台 bundle 用 `/topics onboard` 的 local-only 模式重置。
+
+## 许可证
+
+Apache-2.0（全文见 [LICENSE](./LICENSE)）。

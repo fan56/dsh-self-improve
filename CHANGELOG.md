@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Relicensed to Apache-2.0** — package.json declared `MIT` but the repo shipped no LICENSE file; it now carries the full Apache License 2.0 text (appendix `Copyright 2026 fan56`) and package.json declares `Apache-2.0`. Sole author to date (fan56), so no NOTICE file is needed.
+
 ## 0.2.0 - 2026-10-18
 
 ### Added
