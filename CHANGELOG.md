@@ -3,7 +3,8 @@
 ## [Unreleased]
 
 ### Changed
-- devDeps `@deepseek-ai/*` closure ride: `0.2.1-rc.5` → `0.2.2-rc.1` (commands, session, settings, skill, tools, util-values; schemastery follows the closure `3.18.5` → `3.19.0` — the rc.1 closure peers `~3.19.0`, keeping one copy and one type graph). Dev-only — neither ships in the published tarball. Peer floors stay `>= 0.2.0-rc.2` (the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc). CI/release workflows already resolve the newest of the `latest`/`next` dist-tags with the prerelease-aware comparator (release.yml keeps its existing newest-of current-check, no workflow change this wave).
+- devDeps `@deepseek-ai/*` closure ride: `0.2.1-rc.5` → `0.2.2-rc.1` (commands, session, settings, skill, tools, util-values; schemastery follows the closure `3.18.5` → `3.19.0` — the rc.1 closure peers `~3.19.0`, keeping one copy and one type graph). Dev-only — neither ships in the published tarball. Peer floors stay `>= 0.2.0-rc.2` (the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc). ci.yml already resolves the newest of the `latest`/`next` dist-tags with the prerelease-aware comparator; release.yml's leftover `sort -V` pick is now switched to the same compare (see below).
+- **release.yml picks the host closure with ci.yml's prerelease-aware compare** — the leftover `sort -V` decision (which ranks an rc above a same-version stable once one lands on `latest`, so the release would ride the older rc after a stable 0.2.x lands on `latest`) is replaced by the same node comparator ci.yml uses, so the release gates against exactly the closure CI installs.
 
 ## 0.2.1 - 2026-11-04
 
