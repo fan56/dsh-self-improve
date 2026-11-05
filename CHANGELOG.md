@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- devDeps `@deepseek-ai/*` closure ride: `0.2.1-rc.5` → `0.2.2-rc.1` (commands, session, settings, skill, tools, util-values; schemastery follows the closure `3.18.5` → `3.19.0` — the rc.1 closure peers `~3.19.0`, keeping one copy and one type graph). Dev-only — neither ships in the published tarball. Peer floors stay `>= 0.2.0-rc.2` (the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc). CI/release workflows already resolve the newest of the `latest`/`next` dist-tags with the prerelease-aware comparator (release.yml keeps its existing newest-of current-check, no workflow change this wave).
+
 ## 0.2.1 - 2026-11-04
 
 ### Changed
