@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.3.0 - 2026-11-06
 
 ### Changed
 - devDeps `@deepseek-ai/*` closure ride: `0.2.1-rc.5` → `0.2.2-rc.1` (commands, session, settings, skill, tools, util-values; schemastery follows the closure `3.18.5` → `3.19.0` — the rc.1 closure peers `~3.19.0`, keeping one copy and one type graph; the exact-pinned `@deepseek-ai/cordis` devDep rides too `4.0.4` → `4.1.0` — the rc.1 members peer-demand `~4.1.0`, and the stale pin kept the test tree on the 4.0.4 line while the host closure runs 4.1.0; the peer range `^4.0.2` is unchanged). Dev-only — neither ships in the published tarball. Peer floors stay `>= 0.2.0-rc.2` (the host preflight satisfies ranges with `includePrerelease`, so the floor already matches the new rc). ci.yml already resolves the newest of the `latest`/`next` dist-tags with the prerelease-aware comparator; release.yml's leftover `sort -V` pick is now switched to the same compare (see below).

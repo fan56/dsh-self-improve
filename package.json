@@ -1,6 +1,6 @@
 {
   "name": "@aiwayds/dsh-self-improve",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "dsh-plugin: the self-improvement loop for dsh — session signals become lessons (auto-applied, low-risk) and skill drafts (human-approved before install); topics-memory's ledger is the input",
   "type": "module",
   "main": "lib/index.js",
