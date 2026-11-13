@@ -37,7 +37,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "pretest": "tsc -p tsconfig.json",
-    "test": "node --test 'test/*.test.mjs' test/pure-local.test.mjs",
+    "test": "node --test 'test/*.test.mjs' test/pure-local.test.mjs && node test/packaged-upgrade.test.mjs",
     "smoke": "node scripts/smoke-boot.mjs"
   },
   "peerDependencies": {

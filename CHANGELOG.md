@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- npm packaged upgrade regression test (pnpm 11 strictDepBuilds, see dsh-subagent-registry#10).
+
 ### Changed
 - deps `@aiwayds/dsh-jev-core` `^0.1.4` -> `^0.2.0` — the published dsh-jev-core 0.2.0 (this DOES ship in the tarball, unlike the dev-only closure rides). Peer floor on topics-memory (`>=0.24.0`) already accommodates `0.26.0` — untouched.
 - devDeps ride the dsh `0.2.2-rc.2` host closure: `@deepseek-ai/dsh-commands`, `dsh-session`, `dsh-settings`, `dsh-skill`, `dsh-tools`, `dsh-util-values` exact pins `0.2.2-rc.1` -> `0.2.2-rc.2`; the topics-memory devDep follows its published line `0.25.0` -> `0.26.0`. Lockfile re-resolved on the official registry. Peer floors untouched (`>=0.2.0-rc.2` already matches the new rc under the host preflight's `includePrerelease` semantics). ci.yml / release.yml already resolve the newest of `latest`/`next` with the prerelease-aware comparator — zero CI change this wave.
